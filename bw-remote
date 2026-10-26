@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""bw-remote: genera rclone.conf e ssh config dagli item Bitwarden con i campi remote_*."""
+from __future__ import annotations
+
+import argparse
+import datetime
+import difflib
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
+
+VERSION = "0.1.0"
+
+# remote_type -> tipo rclone
+TYPES = {"ssh": "sftp", "sftp": "sftp", "ftp": "ftp", "ftps": "ftp"}
+DEFAULT_PORTS = {"sftp": 22, "ftp": 21}
+URI_SCHEMES = {"", "ssh", "sftp", "ftp", "ftps"}
+
+ITEM_LOGIN, ITEM_NOTE = 1, 2
+FIELD_LINKED = 3
+LINKED = {100: "username", 101: "password"}
+
+BEGIN = "# BEGIN bw-remote"
+END = "# END bw-remote"
+HEADER = "# generato da bw-remote: non modificare a mano, viene sovrascritto"
+BLOCK_RE = re.compile(r"^# BEGIN bw-remote[ \t]*\n.*?^# END bw-remote[ \t]*(?:\n|\Z)", re.S | re.M)
+NAME_RE = re.compile(r"^[A-Za-z0-9_.+@-]+$")
+
+
+class ItemError(Exception):
+    pass
+
+
+@dataclass
+class Remote:
+    item_id: str
+    item_name: str
+    revision: str
+    kind: str
+    tls: bool
+    name: str
+    host: str
+    user: str
+    port: int
+    pwd: str = ""
+    key: str = ""
+    aliases: list = field(default_factory=list)
+    ssh_aliases: list = field(default_factory=list)
+    rclone_opts: dict = field(default_factory=dict)
+    ssh_opts: dict = field(default_factory=dict)
+
+    @property
+    def ssh_names(self):
+        return [self.name] + self.ssh_aliases
+
+    @property
+    def meta(self):
+        name = " ".join(self.item_name.split())
+        return f"# bw: {self.item_id} {self.revision} {name}"
+
+
+def warn(msg):
+    print(f"! {msg}", file=sys.stderr)
+
+
+def die(msg):
+    print(f"errore: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --- Bitwarden ---------------------------------------------------------------
+
+def run_bw(args):
+    res = subprocess.run(["bw"] + args, capture_output=True, text=True)
+    if res.returncode != 0:
+        die(f"bw {' '.join(args)}: {res.stderr.strip() or res.stdout.strip()}")
+    return res.stdout
+
+
+def load_items(args):
+    if args.input:
+        with open(args.input) as fh:
+            return json.load(fh)
+    if not shutil.which("bw"):
+        die("bw non trovato nel PATH")
+    status = json.loads(run_bw(["status"])).get("status")
+    if status != "unlocked":
+        die(f'bw e {status}: esegui  export BW_SESSION="$(bw unlock --raw)"')
+    if not args.no_sync:
+        run_bw(["sync"])
+    return json.loads(run_bw(["list", "items"]))
+
+
+def item_fields(item):
+    """Campi remote_* dell'item, nome -> lista di valori (i campi possono ripetersi)."""
+    login = item.get("login") or {}
+    out = {}
+    for f in item.get("fields") or []:
+        name = (f.get("name") or "").strip().lower()
+        if not name.startswith("remote_"):
+            continue
+        value = f.get("value")
+        if f.get("type") == FIELD_LINKED:
+            value = login.get(LINKED.get(f.get("linkedId"), ""))
+        if value is None or str(value).strip() == "":
+            continue
+        out.setdefault(name, []).append(str(value).strip())
+    return out
+
+
+def split_uri(uri):
+    if "://" not in uri:
+        uri = "//" + uri
+    try:
+        parts = urlsplit(uri)
+        port = parts.port
+    except ValueError:
+        return "", "", ""
+    return parts.scheme.lower(), parts.hostname or "", str(port or "")
+
+
+def parse_opts(values, label):
+    rclone, ssh = {}, {}
+    for v in values:
+        target, sep, rest = v.partition(":")
+        key, eq, value = rest.partition("=")
+        if not sep or not eq or target not in ("rclone", "ssh") or not key.strip():
+            raise ItemError(f"{label}: remote_opt '{v}' non valido (atteso rclone:chiave=valore o ssh:Chiave=valore)")
+        (rclone if target == "rclone" else ssh)[key.strip()] = value.strip()
+    return rclone, ssh
+
+
+def parse_remote(item):
+    """Remote dall'item, None se l'item non ha remote_type. ItemError se e incompleto."""
+    if item.get("type") not in (ITEM_LOGIN, ITEM_NOTE):
+        return None
+    f = item_fields(item)
+    if "remote_type" not in f:
+        return None
+
+    label = f"\"{item.get('name')}\""
+
+    def one(key):
+        values = f.get(key) or [""]
+        if len(values) > 1:
+            raise ItemError(f"{label}: {key} ripetuto")
+        return values[0]
+
+    rtype = one("remote_type").lower()
+    if rtype not in TYPES:
+        raise ItemError(f"{label}: remote_type '{rtype}' non supportato ({', '.join(TYPES)})")
+    kind = TYPES[rtype]
+
+    login = item.get("login") or {}
+    user = one("remote_user") or (login.get("username") or "")
+    pwd = one("remote_pwd") or (login.get("password") or "")
+    host = one("remote_host")
+    port = one("remote_port")
+    if not host:
+        for u in login.get("uris") or []:
+            scheme, h, p = split_uri(u.get("uri") or "")
+            if h and scheme in URI_SCHEMES:
+                host, port = h, port or p
+                break
+
+    name = one("remote_name")
+    missing = [k for k, v in (("remote_name", name), ("remote_host", host), ("remote_user", user)) if not v]
+    if missing:
+        raise ItemError(f"{label}: manca {', '.join(missing)}")
+    if not NAME_RE.match(name):
+        raise ItemError(f"{label}: remote_name '{name}' contiene caratteri non validi")
+    try:
+        port = int(port) if port else DEFAULT_PORTS[kind]
+    except ValueError:
+        raise ItemError(f"{label}: remote_port '{port}' non e un numero")
+
+    aliases = []
+    for a in f.get("remote_alias", []):
+        alias, _, path = a.partition(":")
+        if not NAME_RE.match(alias):
+            raise ItemError(f"{label}: remote_alias '{a}' non valido (atteso nome:path)")
+        aliases.append((alias, path))
+    ssh_aliases = f.get("remote_ssh_alias", [])
+    for a in ssh_aliases:
+        if not NAME_RE.match(a):
+            raise ItemError(f"{label}: remote_ssh_alias '{a}' non valido")
+    rclone_opts, ssh_opts = parse_opts(f.get("remote_opt", []), label)
+
+    return Remote(
+        item_id=item.get("id", ""),
+        item_name=item.get("name", ""),
+        revision=item.get("revisionDate", ""),
+        kind=kind,
+        tls=rtype == "ftps",
+        name=name,
+        host=host,
+        user=user,
+        port=port,
+        pwd=pwd,
+        key=one("remote_key"),
+        aliases=aliases,
+        ssh_aliases=ssh_aliases,
+        rclone_opts=rclone_opts,
+        ssh_opts=ssh_opts,
+    )
+
+
+def collect(items):
+    remotes, seen = [], {}
+    for item in items:
+        try:
+            r = parse_remote(item)
+        except ItemError as e:
+            warn(f"{e}: saltato")
+            continue
+        if r is None:
+            continue
+        names = [r.name] + [a for a, _ in r.aliases] + r.ssh_aliases
+        clash = [n for n in names if n in seen]
+        if clash:
+            warn(f"\"{r.item_name}\": {', '.join(clash)} gia usato da \"{seen[clash[0]]}\": saltato")
+            continue
+        for n in names:
+            seen[n] = r.item_name
+        remotes.append(r)
+    return sorted(remotes, key=lambda r: r.name)
+
+
+# --- rclone ------------------------------------------------------------------
+
+def default_rclone_config():
+    return os.environ.get("RCLONE_CONFIG") or os.path.expanduser("~/.config/rclone/rclone.conf")
+
+
+def rclone_sections(text):
+    return set(re.findall(r"^\[([^\]]+)\]\s*$", text, re.M))
+
+
+def previous_passwords(block):
+    """name -> (item_id, revision, pass offuscata) dal blocco gestito precedente."""
+    out, meta, section = {}, None, None
+    for line in block.splitlines():
+        if line.startswith("# bw: "):
+            parts = line[6:].split(" ", 2)
+            meta = (parts + ["", ""])[:2]
+        elif line.startswith("["):
+            section = line.strip()[1:-1]
+            if meta:
+                out[section] = (meta[0], meta[1], "")
+            meta = None
+        elif line.startswith("pass = ") and section in out:
+            out[section] = out[section][:2] + (line[7:].strip(),)
+    return out
+
+
+def obscure(pwd):
+    res = subprocess.run(["rclone", "obscure", "-"], input=pwd, capture_output=True, text=True)
+    if res.returncode != 0:
+        die(f"rclone obscure: {res.stderr.strip()}")
+    return res.stdout.strip()
+
+
+def render_rclone(remotes, previous):
+    lines = [BEGIN, HEADER]
+    for r in remotes:
+        kv = {"type": r.kind, "host": r.host, "user": r.user, "port": str(r.port)}
+        if r.pwd:
+            # rclone obscure cambia a ogni chiamata: se l'item non e cambiato teniamo la vecchia
+            old = previous.get(r.name)
+            if old and old[0] == r.item_id and old[1] == r.revision and old[2]:
+                kv["pass"] = old[2]
+            else:
+                kv["pass"] = obscure(r.pwd)
+        if r.key:
+            kv["key_file"] = r.key
+        if r.tls:
+            kv["explicit_tls"] = "true"
+        kv.update(r.rclone_opts)
+        lines += ["", r.meta, f"[{r.name}]"] + [f"{k} = {v}" for k, v in kv.items()]
+        for alias, path in r.aliases:
+            lines += ["", f"[{alias}]", "type = alias", f"remote = {r.name}:{path}"]
+    lines += ["", END]
+    return "\n".join(lines) + "\n"
+
+
+def build_rclone(remotes, text):
+    match = BLOCK_RE.search(text)
+    outside = BLOCK_RE.sub("", text)
+    taken = rclone_sections(outside)
+    kept = []
+    for r in remotes:
+        if r.name in taken:
+            warn(f"rclone: [{r.name}] gia definito fuori dal blocco bw-remote: saltato")
+            continue
+        aliases = []
+        for alias, path in r.aliases:
+            if alias in taken:
+                warn(f"rclone: alias [{alias}] gia definito fuori dal blocco bw-remote: saltato")
+            else:
+                aliases.append((alias, path))
+        kept.append(Remote(**{**r.__dict__, "aliases": aliases}))
+    block = render_rclone(kept, previous_passwords(match.group(0)) if match else {})
+    if match:
+        return text[:match.start()] + block + text[match.end():]
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text.strip():
+        text += "\n"
+    return text + block
+
+
+# --- ssh ---------------------------------------------------------------------
+
+def ssh_hosts(text):
+    hosts = set()
+    for m in re.finditer(r"^\s*Host\s+(.+)$", text, re.M | re.I):
+        hosts.update(m.group(1).split())
+    return hosts
+
+
+def render_ssh(remotes, taken):
+    lines = [HEADER]
+    for r in remotes:
+        if r.kind != "sftp":
+            continue
+        names = []
+        for n in r.ssh_names:
+            if n in taken:
+                warn(f"ssh: Host {n} gia definito in ssh config: saltato")
+            else:
+                names.append(n)
+        if not names:
+            continue
+        opts = {"HostName": r.host, "User": r.user, "Port": str(r.port)}
+        if r.key:
+            opts["IdentityFile"] = r.key
+        opts.update(r.ssh_opts)
+        lines += ["", r.meta, "Host " + " ".join(names)] + [f"  {k} {v}" for k, v in opts.items()]
+    return "\n".join(lines) + "\n"
+
+
+def include_line(path):
+    home = os.path.expanduser("~")
+    shown = "~" + path[len(home):] if path.startswith(home + os.sep) else path
+    return f"Include {shown}"
+
+
+def ensure_include(text, path):
+    line = include_line(path)
+    pattern = re.compile(r"^\s*Include\s+(\S+)\s*$", re.M | re.I)
+    for m in pattern.finditer(text):
+        if os.path.expanduser(m.group(1)) == path:
+            return text
+    # in testa: un Include dopo un Host varrebbe solo per quell'Host
+    return f"{line}\n\n{text}" if text else f"{line}\n"
+
+
+# --- scrittura ---------------------------------------------------------------
+
+def read(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+def mask(line):
+    return re.sub(r"^([-+ ]pass = ).*$", r"\1***", line)
+
+
+def show_diff(path, old, new):
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), path, path, lineterm=""))
+    for line in diff:
+        print(mask(line))
+    return bool(diff)
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if os.path.exists(path):
+        stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        shutil.copy2(path, f"{path}.bak-{stamp}")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".bw-remote-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def cmd_sync(args):
+    remotes = collect(load_items(args))
+    rclone_path = os.path.expanduser(args.rclone_config)
+    ssh_path = os.path.expanduser(args.ssh_config)
+    include_path = os.path.expanduser(args.ssh_include)
+
+    rclone_old = read(rclone_path)
+    ssh_old = read(ssh_path)
+    include_old = read(include_path)
+    targets = [
+        (rclone_path, rclone_old, build_rclone(remotes, rclone_old)),
+        (include_path, include_old, render_ssh(remotes, ssh_hosts(ssh_old))),
+        (ssh_path, ssh_old, ensure_include(ssh_old, include_path)),
+    ]
+
+    changed = [(p, old, new) for p, old, new in targets if show_diff(p, old, new)]
+    n_ssh = sum(1 for r in remotes if r.kind == "sftp")
+    print(f"{len(remotes)} remote da Bitwarden ({n_ssh} ssh/sftp, {len(remotes) - n_ssh} ftp)")
+    if not changed:
+        print("nessuna modifica")
+    elif not args.apply:
+        print("dry-run: rilancia con --apply per scrivere")
+    else:
+        for p, _, new in changed:
+            write(p, new)
+            print(f"scritto {p}")
+
+
+# --- copy-key ----------------------------------------------------------------
+
+ASKPASS = '#!/bin/sh\nprintf "%s\\n" "$BW_REMOTE_PASS"\n'
+
+
+def ssh_base(r):
+    base = ["-p", str(r.port), "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
+    for k, v in r.ssh_opts.items():
+        base += ["-o", f"{k}={v}"]
+    return base
+
+
+def key_works(r, key):
+    opts = ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", key]
+    target = f"{r.user}@{r.host}"
+    base = ssh_base(r)
+    # sftp prima: copre anche gli utenti chroot senza shell
+    sftp_base = ["-P" if a == "-p" else a for a in base]
+    res = subprocess.run(["sftp", "-q", "-b", "-"] + opts + sftp_base + [target],
+                         input="bye\n", capture_output=True, text=True, timeout=60)
+    if res.returncode == 0:
+        return True
+    res = subprocess.run(["ssh"] + opts + base + [target, "true"],
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    return res.returncode == 0
+
+
+def copy_id(r, pub, askpass):
+    env = dict(os.environ, SSH_ASKPASS=askpass, SSH_ASKPASS_REQUIRE="force",
+               BW_REMOTE_PASS=r.pwd, DISPLAY=os.environ.get("DISPLAY", ":0"))
+    cmd = ["ssh-copy-id", "-f", "-i", pub, "-o", "PubkeyAuthentication=no"] + ssh_base(r)
+    last = ""
+    for extra in ([], ["-s"]):
+        res = subprocess.run(cmd[:1] + extra + cmd[1:] + [f"{r.user}@{r.host}"], env=env,
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        if res.returncode == 0:
+            return ""
+        lines = [l for l in (res.stderr + res.stdout).splitlines() if l.strip()]
+        last = lines[-1] if lines else f"exit {res.returncode}"
+    return last
+
+
+def cmd_copy_key(args):
+    remotes = [r for r in collect(load_items(args)) if r.kind == "sftp"]
+    if args.names:
+        remotes = [r for r in remotes
+                   if any(fnmatch.fnmatch(n, p) for n in r.ssh_names for p in args.names)]
+    if not remotes:
+        die("nessun remote ssh/sftp corrispondente")
+
+    tmpdir = tempfile.mkdtemp(prefix="bw-remote-")
+    askpass = os.path.join(tmpdir, "askpass")
+    with open(askpass, "w") as fh:
+        fh.write(ASKPASS)
+    os.chmod(askpass, 0o700)
+
+    failed = 0
+    try:
+        for r in remotes:
+            key = os.path.expanduser(r.key or args.key)
+            pub = key + ".pub"
+            label = f"{r.name} ({r.user}@{r.host}:{r.port})"
+            if not os.path.exists(pub):
+                print(f"KO   {label}: {pub} non trovata")
+                failed += 1
+                continue
+            try:
+                if key_works(r, key):
+                    print(f"ok   {label}: la chiave funziona gia")
+                    continue
+                if not r.pwd:
+                    print(f"KO   {label}: chiave non accettata e remote_pwd mancante")
+                    failed += 1
+                    continue
+                if not args.apply:
+                    print(f"da fare {label}: aggiungerei {pub}")
+                    continue
+                err = copy_id(r, pub, askpass)
+                if err:
+                    print(f"KO   {label}: {err}")
+                    failed += 1
+                elif key_works(r, key):
+                    print(f"+    {label}: chiave aggiunta")
+                else:
+                    print(f"KO   {label}: copiata ma il login con la chiave non funziona")
+                    failed += 1
+            except subprocess.TimeoutExpired:
+                print(f"KO   {label}: timeout")
+                failed += 1
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if not args.apply:
+        print("dry-run: rilancia con --apply per copiare le chiavi")
+    sys.exit(1 if failed else 0)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="bw-remote", description=__doc__)
+    p.add_argument("--version", action="version", version=f"bw-remote {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--apply", action="store_true", help="scrive davvero (default: dry-run)")
+    common.add_argument("--no-sync", action="store_true", help="non esegue bw sync")
+    common.add_argument("--input", metavar="FILE", help="legge gli item da un JSON di bw list items invece che da bw")
+
+    s = sub.add_parser("sync", parents=[common], help="aggiorna rclone.conf e ssh config")
+    s.add_argument("--rclone-config", default=default_rclone_config())
+    s.add_argument("--ssh-config", default="~/.ssh/config")
+    s.add_argument("--ssh-include", default="~/.ssh/config.d/bw-remote")
+    s.set_defaults(func=cmd_sync)
+
+    c = sub.add_parser("copy-key", parents=[common], help="installa la chiave pubblica sugli host ssh/sftp usando la password")
+    c.add_argument("names", nargs="*", help="remote_name o alias ssh (glob), default tutti")
+    c.add_argument("--key", default="~/.ssh/id_ed25519", help="chiave privata se l'item non ha remote_key")
+    c.set_defaults(func=cmd_copy_key)
+
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
