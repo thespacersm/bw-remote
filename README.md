@@ -19,6 +19,45 @@ git clone git@github.com:thespacersm/bw-remote.git
 ln -s "$PWD/bw-remote/bw-remote" /usr/local/bin/bw-remote
 ```
 
+## Configurare un item in Bitwarden
+
+Su un item esistente (Login o Secure Note) si aggiungono questi custom field:
+
+| Campo | Tipo campo | Esempio |
+|---|---|---|
+| `remote_type` | testo | `ssh` |
+| `remote_name` | testo | `example.com` |
+| `remote_host` | testo | `203.0.113.10` |
+| `remote_port` | testo | `2222` (solo se diversa dal default) |
+| `remote_user` | testo | `example` |
+| `remote_pwd` | nascosto | la password |
+
+Risultato:
+
+```ini
+# rclone.conf
+[example.com]
+type = sftp
+host = 203.0.113.10
+user = example
+port = 2222
+pass = <offuscata>
+```
+
+```
+# ~/.ssh/config.d/bw-remote
+Host example.com
+  HostName 203.0.113.10
+  User example
+  Port 2222
+```
+
+Per rclone si usa `rclone ls example.com:`, per ssh `ssh example.com`.
+
+Su un Login, utente, password e host possono restare nei campi nativi dell'item
+(vedi sotto). Su una Secure Note servono sempre i custom field: il testo della nota
+non viene letto.
+
 ## Campi
 
 Il tool considera solo gli item con `remote_type`; tutti gli altri vengono ignorati.
