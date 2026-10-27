@@ -74,6 +74,8 @@ Il tool considera solo gli item con `remote_type`; tutti gli altri vengono ignor
 | `remote_alias` | no, ripetibile | alias rclone `nome:path`, es. `example.com.prod:/var/www` |
 | `remote_ssh_alias` | no, ripetibile | nome in più sulla riga `Host` ssh |
 | `remote_opt` | no, ripetibile | opzione extra: `rclone:chiave=valore` o `ssh:Chiave=valore` |
+| `remote_via` | no | `remote_name` della macchina da cui si raggiunge il sito (vedi sotto) |
+| `remote_path` | no | cartella del sito sulla macchina, solo con `remote_via` |
 
 \* Per i Login, se il campo manca si usano username, password e il primo URI
 `ssh://`, `sftp://`, `ftp://`, `ftps://` (o senza schema) dell'item. Se i custom field
@@ -87,15 +89,20 @@ sono presenti, vincono sempre loro. Si possono usare anche i campi di tipo "link
 | `ftp` | remote `type = ftp` | - |
 | `ftps` | remote `type = ftp` con `explicit_tls = true` | - |
 
-- **rclone**: scrive solo nel blocco `# BEGIN bw-remote` / `# END bw-remote` di
-  `rclone.conf` (rispetta `RCLONE_CONFIG`) e lascia intatto il resto del file. Le password
-  passano da `rclone obscure`; se l'item non è cambiato, la password offuscata già scritta
-  viene riusata, così il diff resta pulito.
+- **rclone**: in `rclone.conf` (rispetta `RCLONE_CONFIG`) rigenera solo le sezioni con
+  `description = bw-remote <id item> <revisione> <nome item>`, in fondo al file, e lascia
+  intatte quelle scritte a mano. Si usa la description e non dei commenti perché rclone
+  riscrive il file (perdendo i commenti) quando salva i valori che rileva al primo uso;
+  quei valori (`shell_type`, `md5sum_command`, `sha1sum_command`) vengono conservati.
+  Le password passano da `rclone obscure`; se l'item non è cambiato, la password offuscata
+  già scritta viene riusata, così il diff resta pulito. Per vedere i remote generati:
+  `rclone listremotes --long --description bw-remote`.
 - **ssh**: rigenera `~/.ssh/config.d/bw-remote` e aggiunge
   `Include ~/.ssh/config.d/bw-remote` in testa a `~/.ssh/config`, se manca.
 - Se più item hanno lo stesso `remote_name`, in ogni file il nome senza suffisso va a:
   1. l'item che non ha `OLD` nel nome,
-  2. poi al tipo più adatto al file (rclone: `sftp`, `ftps`, `ftp`, `ssh`; ssh: `ssh`, `sftp`),
+  2. poi al tipo più adatto al file (rclone: `sftp`, `ftps`, `ftp`, `ssh`, via macchina;
+     ssh: via macchina, `ssh`, `sftp`),
   3. poi al più recente.
 
   Gli altri prendono il suffisso `.old` (se l'item ha `OLD` nel nome) o `.<remote_type>`,
@@ -110,9 +117,30 @@ sono presenti, vincono sempre loro. Si possono usare anche i campi di tipo "link
 
   Con un solo item `ssh` e `sftp` restano sinonimi. Gli alias (`remote_alias`,
   `remote_ssh_alias`) invece devono essere unici: un alias duplicato viene saltato.
-- I nomi già definiti a mano fuori dal blocco (sezioni rclone o `Host` in `~/.ssh/config`)
+- I nomi già definiti a mano (sezioni rclone senza la description di bw-remote o `Host` in `~/.ssh/config`)
   hanno la precedenza: la voce da Bitwarden viene saltata con un avviso.
 - Prima di ogni scrittura salva un backup `<file>.bak-AAAAMMGGhhmmss`.
+
+## Siti raggiungibili da una macchina (`remote_via`)
+
+Quando un sito ha un suo accesso SFTP (spesso chroot) e in più si raggiunge da una
+macchina su cui si ha un accesso ssh globale:
+
+1. l'item della macchina ha i suoi campi (`remote_type ssh`, `remote_name example-host`, …);
+2. l'item del sito ha, oltre ai suoi, `remote_via example-host` e `remote_path /srv/siti/example`.
+
+Risultato:
+
+| | rclone | ssh |
+|---|---|---|
+| `example.com` | SFTP diretto (utente del sito) | ssh con utente e chiave della macchina |
+| `example.com.ssh` | alias `example-host:/srv/siti/example` | - |
+| `example.com.sftp` | - | SFTP diretto (utente del sito) |
+
+In rclone resta principale l'accesso diretto, così i file caricati restano dell'utente
+del sito; in ssh è principale la shell dalla macchina. Un item con `remote_via` ma
+senza host e utente genera solo l'accesso dalla macchina. `copy-key` salta gli accessi
+via macchina: la chiave va copiata sulla macchina una volta sola.
 
 ## Uso
 

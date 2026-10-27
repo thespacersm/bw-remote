@@ -116,11 +116,60 @@ class ResolveNamesTest(unittest.TestCase):
                          {"s.it": "nuovo", "s.it.sftp": "vecchio", "s.it.old": "altro OLD", "s.it.old-2": "altro2 OLD"})
 
 
+class ViaTest(unittest.TestCase):
+    def setUp(self):
+        self.machine = login("Macchina", [field("remote_type", "ssh"), field("remote_name", "mach"),
+                                          field("remote_host", "10.0.0.1"), field("remote_key", "~/.ssh/k")],
+                             username="admin")
+        self.site = note("SFTP site", [field("remote_type", "sftp"), field("remote_name", "site.it"),
+                                       field("remote_host", "10.0.0.1"), field("remote_user", "site"),
+                                       field("remote_via", "mach"), field("remote_path", "/srv/siti/site")])
+
+    def resolve(self, items, target):
+        with mock.patch.object(bw, "warn"):
+            return {r.name: r for r in bw.resolve_names(bw.collect(items), target)}
+
+    def test_ssh_config_main_name_goes_via_machine(self):
+        ssh = self.resolve([self.machine, self.site], "ssh")
+        self.assertEqual(sorted(ssh), ["mach", "site.it", "site.it.sftp"])
+        self.assertEqual((ssh["site.it"].user, ssh["site.it"].key), ("admin", "~/.ssh/k"))
+        self.assertEqual(ssh["site.it.sftp"].user, "site")
+        out = bw.render_ssh(list(ssh.values()), set())
+        self.assertIn("Host site.it\n  HostName 10.0.0.1\n  User admin\n  Port 22\n  IdentityFile ~/.ssh/k\n", out)
+
+    def test_rclone_main_name_is_direct_and_via_is_alias(self):
+        rclone = self.resolve([self.machine, self.site], "rclone")
+        self.assertEqual(sorted(rclone), ["mach", "site.it", "site.it.ssh"])
+        with mock.patch.object(bw, "obscure", side_effect=lambda pwd: "OBS"):
+            out = bw.build_rclone(list(rclone.values()), "")
+        self.assertRegex(out, r"\[site.it\]\ntype = sftp\ndescription = .*\nhost = 10.0.0.1\nuser = site\n")
+        self.assertRegex(out, r"\[site.it.ssh\]\ntype = alias\ndescription = .*\nremote = mach:/srv/siti/site\n")
+
+    def test_via_only_item(self):
+        site = note("Solo via", [field("remote_type", "ssh"), field("remote_name", "site.it"),
+                                 field("remote_via", "mach"), field("remote_path", "/srv/x")])
+        self.assertEqual(sorted(self.resolve([self.machine, site], "ssh")), ["mach", "site.it"])
+        self.assertEqual(sorted(self.resolve([self.machine, site], "rclone")), ["mach", "site.it"])
+
+    def test_unknown_machine_and_path_without_via(self):
+        with mock.patch.object(bw, "warn") as w:
+            remotes = bw.collect([self.site])
+        self.assertEqual([r.rtype for r in remotes], ["sftp"])
+        w.assert_called_once()
+        with self.assertRaises(bw.ItemError):
+            bw.parse_remote(note(fields=[field("remote_type", "ssh"), field("remote_name", "n"),
+                                         field("remote_host", "h"), field("remote_user", "u"),
+                                         field("remote_path", "/x")]))
+
+
 def sftp(name="web01", rev="r1", **kw):
     data = dict(item_id="id1", item_name="Server 1", revision=rev, kind="sftp", tls=False,
                 name=name, host="h", user="u", port=22, pwd="pw")
     data.update(kw)
     return bw.Remote(**data)
+
+
+DESC = "description = bw-remote id1 r1 Server 1"
 
 
 class RcloneTest(unittest.TestCase):
@@ -129,20 +178,28 @@ class RcloneTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def test_block_appended_and_outside_kept(self):
-        text = "[manual]\ntype = local\n"
+    def test_managed_sections_appended_and_manual_kept(self):
+        text = "# mio\n[manual]\ntype = local\n"
         out = bw.build_rclone([sftp(aliases=[("site.prod", "/www")])], text)
-        self.assertTrue(out.startswith("[manual]\ntype = local\n\n# BEGIN bw-remote\n"))
-        self.assertIn("[web01]\ntype = sftp\nhost = h\nuser = u\nport = 22\npass = OBS-pw\n", out)
-        self.assertIn("[site.prod]\ntype = alias\nremote = web01:/www\n", out)
-        self.assertTrue(out.endswith("# END bw-remote\n"))
+        self.assertTrue(out.startswith("# mio\n[manual]\ntype = local\n\n[web01]\n"))
+        self.assertIn(f"[web01]\ntype = sftp\n{DESC}\nhost = h\nuser = u\nport = 22\npass = OBS-pw\n", out)
+        self.assertIn(f"[site.prod]\ntype = alias\n{DESC}\nremote = web01:/www\n", out)
 
-    def test_block_replaced_in_place(self):
-        text = "[a]\ntype = local\n\n# BEGIN bw-remote\n[old]\n# END bw-remote\n\n[z]\ntype = local\n"
+    def test_managed_sections_regenerated_manual_order_kept(self):
+        text = f"[a]\ntype = local\n\n[old]\ntype = sftp\n{DESC}\n\n# commento di z\n[z]\ntype = local\n"
         out = bw.build_rclone([sftp()], text)
         self.assertNotIn("[old]", out)
-        self.assertTrue(out.startswith("[a]\ntype = local\n\n# BEGIN bw-remote\n"))
-        self.assertTrue(out.endswith("# END bw-remote\n\n[z]\ntype = local\n"))
+        self.assertTrue(out.startswith("[a]\ntype = local\n\n# commento di z\n[z]\ntype = local\n\n[web01]\n"))
+
+    def test_survives_rclone_rewrite_and_legacy_format(self):
+        # formato 0.1 dopo che rclone ha riscritto il file: niente # END, chiavi rilevate aggiunte
+        text = ("# BEGIN bw-remote\n# generato da bw-remote: non modificare a mano, viene sovrascritto\n"
+                "# bw: id1 r1 Server 1\n[web01]\ntype = sftp\nhost = h\npass = OLDOBS\nshell_type = unix\n\n"
+                "[manual]\ntype = local\n")
+        out = bw.build_rclone([sftp()], text)
+        self.assertEqual(out, "[manual]\ntype = local\n\n[web01]\ntype = sftp\n" + DESC +
+                         "\nhost = h\nuser = u\nport = 22\npass = OLDOBS\nshell_type = unix\n\n")
+        self.assertEqual(bw.build_rclone([sftp()], out), out)
 
     def test_obscured_password_reused_when_item_unchanged(self):
         first = bw.build_rclone([sftp()], "")
@@ -150,16 +207,20 @@ class RcloneTest(unittest.TestCase):
         self.assertEqual(bw.build_rclone([sftp()], first), first)
         self.assertIn("pass = NEW-pw", bw.build_rclone([sftp(rev="r2")], first))
 
-    def test_conflicts_outside_block_are_skipped(self):
+    def test_auto_keys_dropped_when_host_changes(self):
+        first = bw.build_rclone([sftp()], "").replace("pass = OBS-pw\n", "pass = OBS-pw\nshell_type = unix\n")
+        self.assertIn("shell_type = unix", bw.build_rclone([sftp()], first))
+        self.assertNotIn("shell_type", bw.build_rclone([sftp(rev="r2", host="h2")], first))
+
+    def test_manual_names_win(self):
         with mock.patch.object(bw, "warn"):
-            out = bw.build_rclone([sftp(aliases=[("site.prod", "/www")])], "[web01]\ntype = local\n")
-        block = bw.BLOCK_RE.search(out).group(0)
-        self.assertNotIn("[web01]", block)
-        self.assertNotIn("[site.prod]", block)
+            out = bw.build_rclone([sftp(aliases=[("site.prod", "/www")])],
+                                  "[web01]\ntype = local\n\n[site.prod]\ntype = local\n")
+        self.assertEqual(out, "[web01]\ntype = local\n\n[site.prod]\ntype = local\n")
 
     def test_ftps(self):
         out = bw.build_rclone([sftp(kind="ftp", tls=True, port=21, pwd="")], "")
-        self.assertIn("type = ftp\nhost = h\nuser = u\nport = 21\nexplicit_tls = true\n", out)
+        self.assertIn(f"type = ftp\n{DESC}\nhost = h\nuser = u\nport = 21\nexplicit_tls = true\n", out)
 
 
 class SshTest(unittest.TestCase):

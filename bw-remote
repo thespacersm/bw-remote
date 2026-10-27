@@ -27,15 +27,22 @@ ITEM_LOGIN, ITEM_NOTE = 1, 2
 FIELD_LINKED = 3
 LINKED = {100: "username", 101: "password"}
 
-BEGIN = "# BEGIN bw-remote"
-END = "# END bw-remote"
 HEADER = "# generato da bw-remote: non modificare a mano, viene sovrascritto"
-BLOCK_RE = re.compile(r"^# BEGIN bw-remote[ \t]*\n.*?^# END bw-remote[ \t]*(?:\n|\Z)", re.S | re.M)
+# rclone riscrive rclone.conf (e perde i commenti) quando salva i valori che rileva da solo:
+# le sezioni generate si riconoscono dalla description, che rclone conserva
+DESC_RE = re.compile(r"^description\s*=\s*bw-remote\s+(\S+)\s+(\S+)")
+LEGACY_META_RE = re.compile(r"^# bw: (\S+) (\S+)")
+LEGACY_LINE_RE = re.compile(r"^# (BEGIN bw-remote|END bw-remote|generato da bw-remote|bw: )")
+SECTION_RE = re.compile(r"^\[([^\]]+)\]\s*$")
+# valori che rclone rileva al primo uso di un remote sftp e salva nel file
+AUTO_KEYS = ("shell_type", "md5sum_command", "sha1sum_command")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.+@-]+$")
 OLD_RE = re.compile(r"\bOLD\b")
 
 # a parita di remote_name, il tipo che in ogni file prende il nome senza suffisso
-PREFERRED = {"rclone": ["sftp", "ftps", "ftp", "ssh"], "ssh": ["ssh", "sftp"]}
+# "via" e l'accesso al sito passando dalla macchina (remote_via): principale in ssh config,
+# mentre in rclone resta principale l'accesso diretto (i file restano dell'utente del sito)
+PREFERRED = {"rclone": ["sftp", "ftps", "ftp", "ssh", "via"], "ssh": ["via", "ssh", "sftp"]}
 
 
 class ItemError(Exception):
@@ -61,6 +68,10 @@ class Remote:
     ssh_opts: dict = field(default_factory=dict)
     rtype: str = ""
     old: bool = False
+    direct: bool = True
+    via: str = ""
+    via_id: str = ""
+    path: str = ""
 
     @property
     def ssh_names(self):
@@ -177,7 +188,15 @@ def parse_remote(item):
                 break
 
     name = one("remote_name")
-    missing = [k for k, v in (("remote_name", name), ("remote_host", host), ("remote_user", user)) if not v]
+    via = one("remote_via")
+    path = one("remote_path")
+    if path and not via:
+        raise ItemError(f"{label}: remote_path vale solo insieme a remote_via")
+    # con remote_via l'accesso diretto e facoltativo: senza host e utente c'e solo quello via macchina
+    required = [("remote_name", name)]
+    if not via or host or user:
+        required += [("remote_host", host), ("remote_user", user)]
+    missing = [k for k, v in required if not v]
     if missing:
         raise ItemError(f"{label}: manca {', '.join(missing)}")
     if not NAME_RE.match(name):
@@ -217,6 +236,9 @@ def parse_remote(item):
         ssh_opts=ssh_opts,
         rtype=rtype,
         old=bool(OLD_RE.search(item.get("name", ""))),
+        direct=bool(host),
+        via=via,
+        path=path,
     )
 
 
@@ -230,10 +252,35 @@ def collect(items):
             continue
         if r is not None:
             remotes.append(r)
+    remotes = [r for r in remotes if r.direct] + derive_via(remotes)
     remotes.sort(key=lambda r: (r.name, r.old, r.item_id))
     drop_alias_clashes(remotes, "aliases", "remote_alias", key=lambda a: a[0])
     drop_alias_clashes(remotes, "ssh_aliases", "remote_ssh_alias")
     return remotes
+
+
+def derive_via(remotes):
+    """Per ogni item con remote_via, un remote con i dati di accesso della macchina."""
+    machines = {}
+    for m in remotes:
+        if m.direct and m.kind == "sftp":
+            machines.setdefault(m.name, []).append(m)
+    for group in machines.values():
+        group.sort(key=lambda m: m.revision, reverse=True)
+        group.sort(key=lambda m: m.old)
+    out = []
+    for r in remotes:
+        if not r.via:
+            continue
+        m = (machines.get(r.via) or [None])[0]
+        if m is None or m.item_id == r.item_id:
+            warn(f"\"{r.item_name}\": remote_via {r.via} non e il remote_name di un item ssh/sftp: saltato")
+            continue
+        out.append(replace(
+            m, item_id=r.item_id, item_name=f"{r.item_name} (via {m.name})", revision=r.revision,
+            name=r.name, rtype="via", old=r.old, via=m.name, via_id=m.item_id, path=r.path,
+            aliases=[] if r.direct else r.aliases, ssh_aliases=[] if r.direct else r.ssh_aliases))
+    return out
 
 
 def drop_alias_clashes(remotes, attr, label, key=lambda a: a):
@@ -277,7 +324,15 @@ def resolve_names(remotes, target):
         group.sort(key=lambda r: (r.old, rank.index(r.rtype)))
         out.append(group[0])
         for r in group[1:]:
-            base = f"{name}.old" if r.old else f"{name}.{r.rtype}"
+            if r.old:
+                suffix = "old"
+            elif r.rtype == "via":
+                suffix = "ssh"
+            elif any(g.rtype == "via" for g in group):
+                suffix = "sftp"
+            else:
+                suffix = r.rtype
+            base = f"{name}.{suffix}"
             new, n = base, 2
             while new in taken:
                 new, n = f"{base}-{n}", n + 1
@@ -293,24 +348,41 @@ def default_rclone_config():
     return os.environ.get("RCLONE_CONFIG") or os.path.expanduser("~/.config/rclone/rclone.conf")
 
 
-def rclone_sections(text):
-    return set(re.findall(r"^\[([^\]]+)\]\s*$", text, re.M))
+def split_sections(text):
+    """(preambolo, [(nome, righe)]); i commenti subito sopra una sezione restano con lei."""
+    lines = text.splitlines()
+    heads = [i for i, l in enumerate(lines) if SECTION_RE.match(l)]
+    starts, prev = [], 0
+    for i in heads:
+        start = i
+        while start > prev and lines[start - 1].lstrip().startswith(("#", ";")):
+            start -= 1
+        starts.append(start)
+        prev = i + 1
+    preamble = lines[:starts[0]] if starts else lines
+    sections = []
+    for k, i in enumerate(heads):
+        end = starts[k + 1] if k + 1 < len(starts) else len(lines)
+        sections.append((SECTION_RE.match(lines[i]).group(1), lines[starts[k]:end]))
+    return preamble, sections
 
 
-def previous_passwords(block):
-    """name -> (item_id, revision, pass offuscata) dal blocco gestito precedente."""
-    out, meta, section = {}, None, None
-    for line in block.splitlines():
-        if line.startswith("# bw: "):
-            parts = line[6:].split(" ", 2)
-            meta = (parts + ["", ""])[:2]
-        elif line.startswith("["):
-            section = line.strip()[1:-1]
-            if meta:
-                out[section] = (meta[0], meta[1], "")
-            meta = None
-        elif line.startswith("pass = ") and section in out:
-            out[section] = out[section][:2] + (line[7:].strip(),)
+def managed_info(lines):
+    """(item_id, revision) se la sezione e generata da bw-remote, altrimenti None."""
+    for line in lines:
+        # LEGACY_META_RE: sezioni scritte dalla 0.1, marcate con un commento
+        m = DESC_RE.match(line) or LEGACY_META_RE.match(line)
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def section_values(lines):
+    out = {}
+    for line in lines:
+        key, eq, value = line.partition("=")
+        if eq and not line.lstrip().startswith(("#", ";", "[")):
+            out[key.strip()] = value.strip()
     return out
 
 
@@ -322,52 +394,76 @@ def obscure(pwd):
 
 
 def render_rclone(remotes, previous):
-    lines = [BEGIN, HEADER]
+    """Una lista di righe per ogni sezione; previous: nome -> ((item_id, revision), valori)."""
+    chunks = []
+    # nome con cui la macchina compare in rclone.conf, per gli alias via macchina
+    machine_names = {r.item_id: r.name for r in remotes if r.rtype != "via"}
     for r in remotes:
-        kv = {"type": r.kind, "host": r.host, "user": r.user, "port": str(r.port)}
-        if r.pwd:
-            # rclone obscure cambia a ogni chiamata: se l'item non e cambiato teniamo la vecchia
-            old = previous.get(r.name)
-            if old and old[0] == r.item_id and old[1] == r.revision and old[2]:
-                kv["pass"] = old[2]
-            else:
-                kv["pass"] = obscure(r.pwd)
-        if r.key:
-            kv["key_file"] = r.key
-        if r.tls:
-            kv["explicit_tls"] = "true"
-        kv.update(r.rclone_opts)
-        lines += ["", r.meta, f"[{r.name}]"] + [f"{k} = {v}" for k, v in kv.items()]
+        desc = f"bw-remote {r.item_id} {r.revision} {' '.join(r.item_name.split())}"
+        if r.rtype == "via":
+            machine = machine_names.get(r.via_id)
+            if machine is None:
+                warn(f"rclone: {r.name}: la macchina {r.via} non e in rclone.conf: saltato")
+                continue
+            kv = {"type": "alias", "description": desc, "remote": f"{machine}:{r.path}"}
+        else:
+            kv = {"type": r.kind, "description": desc, "host": r.host, "user": r.user, "port": str(r.port)}
+            old_meta, old = previous.get(r.name, (None, {}))
+            if r.pwd:
+                # rclone obscure cambia a ogni chiamata: se l'item non e cambiato teniamo la vecchia
+                same = old_meta == (r.item_id, r.revision) and old.get("pass")
+                kv["pass"] = old["pass"] if same else obscure(r.pwd)
+            if r.key:
+                kv["key_file"] = r.key
+            if r.tls:
+                kv["explicit_tls"] = "true"
+            kv.update(r.rclone_opts)
+            if r.kind == "sftp" and old.get("host") == r.host:
+                for k in AUTO_KEYS:
+                    if k in old and k not in kv:
+                        kv[k] = old[k]
+        chunks.append([f"[{r.name}]"] + [f"{k} = {v}" for k, v in kv.items()])
         for alias, path in r.aliases:
-            lines += ["", f"[{alias}]", "type = alias", f"remote = {r.name}:{path}"]
-    lines += ["", END]
-    return "\n".join(lines) + "\n"
+            chunks.append([f"[{alias}]", "type = alias", f"description = {desc}", f"remote = {r.name}:{path}"])
+    return chunks
 
 
 def build_rclone(remotes, text):
-    match = BLOCK_RE.search(text)
-    outside = BLOCK_RE.sub("", text)
-    taken = rclone_sections(outside)
+    """Il file con le sezioni scritte a mano invariate e quelle di bw-remote rigenerate in fondo."""
+    preamble, sections = split_sections(text)
+    previous, manual = {}, []
+    for name, lines in sections:
+        info = managed_info(lines)
+        if info:
+            previous[name] = (info, section_values(lines))
+        else:
+            manual.append((name, lines))
+    taken = {name for name, _ in manual}
     kept = []
     for r in remotes:
         if r.name in taken:
-            warn(f"rclone: [{r.name}] gia definito fuori dal blocco bw-remote: saltato")
+            warn(f"rclone: [{r.name}] gia definito a mano in rclone.conf: saltato")
             continue
         aliases = []
         for alias, path in r.aliases:
             if alias in taken:
-                warn(f"rclone: alias [{alias}] gia definito fuori dal blocco bw-remote: saltato")
+                warn(f"rclone: alias [{alias}] gia definito a mano in rclone.conf: saltato")
             else:
                 aliases.append((alias, path))
         kept.append(replace(r, aliases=aliases))
-    block = render_rclone(kept, previous_passwords(match.group(0)) if match else {})
-    if match:
-        return text[:match.start()] + block + text[match.end():]
-    if text and not text.endswith("\n"):
-        text += "\n"
-    if text.strip():
-        text += "\n"
-    return text + block
+
+    out = [l for l in preamble if not LEGACY_LINE_RE.match(l)]
+    for _, lines in manual:
+        out += [l for l in lines if not LEGACY_LINE_RE.match(l)]
+    while out and not out[-1].strip():
+        out.pop()
+    chunks = render_rclone(kept, previous)
+    for chunk in chunks:
+        out += ([""] if out else []) + chunk
+    if not out:
+        return ""
+    # come rclone quando riscrive il file: riga vuota anche dopo l'ultima sezione
+    return "\n".join(out) + ("\n\n" if chunks else "\n")
 
 
 # --- ssh ---------------------------------------------------------------------
@@ -520,7 +616,8 @@ def copy_id(r, pub, askpass):
 
 
 def cmd_copy_key(args):
-    remotes = resolve_names(collect(load_items(args)), "ssh")
+    # gli accessi via macchina usano l'utente della macchina: la chiave va copiata una volta sola
+    remotes = [r for r in resolve_names(collect(load_items(args)), "ssh") if r.rtype != "via"]
     if args.names:
         remotes = [r for r in remotes
                    if any(fnmatch.fnmatch(n, p) for n in r.ssh_names for p in args.names)]
