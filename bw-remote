@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import datetime
 import difflib
 import fnmatch
@@ -352,10 +353,6 @@ def resolve_names(remotes, target):
 
 # --- rclone ------------------------------------------------------------------
 
-def default_rclone_config():
-    return os.environ.get("RCLONE_CONFIG") or os.path.expanduser("~/.config/rclone/rclone.conf")
-
-
 def split_sections(text):
     """(preambolo, [(nome, righe)]); i commenti subito sopra una sezione restano con lei."""
     lines = text.splitlines()
@@ -696,29 +693,79 @@ def cmd_copy_key(args):
     sys.exit(1 if failed else 0)
 
 
-def main(argv=None):
+# --- config ------------------------------------------------------------------
+
+CONFIG_SECTION = "defaults"
+CONFIG_DEFAULTS = {
+    "key": DEFAULT_KEY,
+    "rclone_config": "~/.config/rclone/rclone.conf",
+    "ssh_config": "~/.ssh/config",
+    "ssh_include": "~/.ssh/config.d/bw-remote",
+}
+
+
+def default_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "bw-remote", "config")
+
+
+def load_config(path, explicit=False):
+    """Valori della sezione [defaults] del file di config; il file puo mancare se non e esplicito."""
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            cp.read_file(fh)
+    except FileNotFoundError:
+        if explicit:
+            die(f"file di config {path} non trovato")
+        return {}
+    except configparser.Error as e:
+        die(f"{path}: {e}")
+    for section in cp.sections():
+        if section != CONFIG_SECTION:
+            warn(f"{path}: sezione [{section}] sconosciuta: ignorata")
+    values = dict(cp[CONFIG_SECTION]) if cp.has_section(CONFIG_SECTION) else {}
+    for key in sorted(set(values) - set(CONFIG_DEFAULTS)):
+        warn(f"{path}: chiave '{key}' sconosciuta: ignorata")
+    return {k: v for k, v in values.items() if k in CONFIG_DEFAULTS and v}
+
+
+def build_parser(conf):
+    """Precedenza: opzione da riga di comando, variabile d'ambiente, file di config, default."""
+    d = {**CONFIG_DEFAULTS, **conf}
+    rclone_config = os.environ.get("RCLONE_CONFIG") or d["rclone_config"]
+
     p = argparse.ArgumentParser(prog="bw-remote", description=__doc__)
     p.add_argument("--version", action="version", version=f"bw-remote {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", metavar="FILE", help=f"file di config (default {default_config_path()})")
     common.add_argument("--apply", action="store_true", help="scrive davvero (default: dry-run)")
     common.add_argument("--no-sync", action="store_true", help="non esegue bw sync")
     common.add_argument("--input", metavar="FILE", help="legge gli item da un JSON di bw list items invece che da bw")
-    common.add_argument("--key", default=DEFAULT_KEY,
-                        help=f"chiave privata per gli item senza remote_key (default {DEFAULT_KEY})")
+    common.add_argument("--key", default=d["key"],
+                        help=f"chiave privata per gli item senza remote_key (ora {d['key']})")
 
     s = sub.add_parser("sync", parents=[common], help="aggiorna rclone.conf e ssh config")
-    s.add_argument("--rclone-config", default=default_rclone_config())
-    s.add_argument("--ssh-config", default="~/.ssh/config")
-    s.add_argument("--ssh-include", default="~/.ssh/config.d/bw-remote")
+    s.add_argument("--rclone-config", default=rclone_config, help=f"(ora {rclone_config})")
+    s.add_argument("--ssh-config", default=d["ssh_config"], help=f"(ora {d['ssh_config']})")
+    s.add_argument("--ssh-include", default=d["ssh_include"], help=f"(ora {d['ssh_include']})")
     s.set_defaults(func=cmd_sync)
 
     c = sub.add_parser("copy-key", parents=[common], help="installa la chiave pubblica sugli host ssh/sftp usando la password")
     c.add_argument("names", nargs="*", help="remote_name o alias ssh (glob), default tutti")
     c.set_defaults(func=cmd_copy_key)
+    return p
 
-    args = p.parse_args(argv)
+
+def main(argv=None):
+    # --config va letto prima di costruire il parser, perche ne cambia i default
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    known, _ = pre.parse_known_args(argv)
+    conf = load_config(known.config or default_config_path(), explicit=bool(known.config))
+    args = build_parser(conf).parse_args(argv)
     args.func(args)
 
 

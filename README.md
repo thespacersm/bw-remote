@@ -19,6 +19,22 @@ git clone git@github.com:thespacersm/bw-remote.git
 ln -s "$PWD/bw-remote/bw-remote" /usr/local/bin/bw-remote
 ```
 
+## Configurazione
+
+Facoltativa: `~/.config/bw-remote/config` (rispetta `XDG_CONFIG_HOME`, oppure
+`--config FILE`), in formato INI. Esempio completo in [`config.example`](config.example):
+
+```ini
+[defaults]
+key = ~/.ssh/id_rsa
+rclone_config = ~/.config/rclone/rclone.conf
+ssh_config = ~/.ssh/config
+ssh_include = ~/.ssh/config.d/bw-remote
+```
+
+Precedenza: opzione da riga di comando, poi `RCLONE_CONFIG` (solo per `rclone_config`),
+poi il file, poi i default qui sopra. Chiavi o sezioni sconosciute danno un avviso.
+
 ## Configurare un item in Bitwarden
 
 Su un item esistente (Login o Secure Note) si aggiungono questi custom field:
@@ -177,7 +193,7 @@ bw-remote copy-key 'example.*' --apply  # installa la chiave usando remote_pwd
 3. rifà il controllo e stampa l'esito.
 
 Opzioni comuni: `--no-sync` (salta `bw sync`), `--input FILE` (legge un JSON di
-`bw list items` invece di chiamare `bw`), `--key FILE` (chiave per gli item senza
+`bw list items` invece di chiamare `bw`), `--config FILE`, `--key FILE` (chiave per gli item senza
 `remote_key`, default `~/.ssh/id_rsa`).
 
 ## Test

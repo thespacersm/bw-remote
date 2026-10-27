@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -265,6 +266,43 @@ class SshTest(unittest.TestCase):
         out = bw.ensure_include("Host a\n  User x\n", path)
         self.assertTrue(out.startswith("Include ~/.ssh/config.d/bw-remote\n\nHost a\n"))
         self.assertEqual(bw.ensure_include(out, path), out)
+
+
+class ConfigTest(unittest.TestCase):
+    def write(self, text):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_load_config(self):
+        path = self.write("[defaults]\nkey = ~/.ssh/altra\nfoo = bar\n\n[altro]\nx = 1\n")
+        with mock.patch.object(bw, "warn") as w:
+            self.assertEqual(bw.load_config(path), {"key": "~/.ssh/altra"})
+        self.assertEqual(w.call_count, 2)
+
+    def test_missing_file(self):
+        self.assertEqual(bw.load_config("/nonexistent/bw-remote"), {})
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr"):
+                bw.load_config("/nonexistent/bw-remote", explicit=True)
+
+    def test_xdg_path(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/x"}):
+            self.assertEqual(bw.default_config_path(), "/x/bw-remote/config")
+
+    def test_precedence(self):
+        conf = {"key": "~/.ssh/conf", "rclone_config": "/conf/rclone.conf"}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RCLONE_CONFIG", None)
+            args = bw.build_parser(conf).parse_args(["sync"])
+            self.assertEqual((args.key, args.rclone_config, args.ssh_config),
+                             ("~/.ssh/conf", "/conf/rclone.conf", "~/.ssh/config"))
+            self.assertEqual(bw.build_parser(conf).parse_args(["sync", "--key", "~/k"]).key, "~/k")
+            os.environ["RCLONE_CONFIG"] = "/env/rclone.conf"
+            self.assertEqual(bw.build_parser(conf).parse_args(["sync"]).rclone_config, "/env/rclone.conf")
+        self.assertEqual(bw.build_parser({}).parse_args(["copy-key"]).key, "~/.ssh/id_rsa")
 
 
 if __name__ == "__main__":

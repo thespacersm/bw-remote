@@ -1,0 +1,11 @@
+# bw-remote: copia in ~/.config/bw-remote/config (o $XDG_CONFIG_HOME/bw-remote/config).
+# Le opzioni da riga di comando e RCLONE_CONFIG hanno la precedenza su questo file.
+
+[defaults]
+# chiave privata per gli item senza remote_key (rclone e copy-key)
+key = ~/.ssh/id_rsa
+
+# file generati
+rclone_config = ~/.config/rclone/rclone.conf
+ssh_config = ~/.ssh/config
+ssh_include = ~/.ssh/config.d/bw-remote
