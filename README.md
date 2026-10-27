@@ -93,6 +93,23 @@ sono presenti, vincono sempre loro. Si possono usare anche i campi di tipo "link
   viene riusata, così il diff resta pulito.
 - **ssh**: rigenera `~/.ssh/config.d/bw-remote` e aggiunge
   `Include ~/.ssh/config.d/bw-remote` in testa a `~/.ssh/config`, se manca.
+- Se più item hanno lo stesso `remote_name`, in ogni file il nome senza suffisso va a:
+  1. l'item che non ha `OLD` nel nome,
+  2. poi al tipo più adatto al file (rclone: `sftp`, `ftps`, `ftp`, `ssh`; ssh: `ssh`, `sftp`),
+  3. poi al più recente.
+
+  Gli altri prendono il suffisso `.old` (se l'item ha `OLD` nel nome) o `.<remote_type>`,
+  più `-2`, `-3`… se serve. Per esempio, un sito con un item `ssh` (utente con shell) e uno
+  `sftp` (utente chroot) diventa:
+
+  | | rclone | ssh |
+  |---|---|---|
+  | item `sftp` | `example.com` | `example.com.sftp` |
+  | item `ssh` | `example.com.ssh` | `example.com` |
+  | item `OLD …` | `example.com.old` | `example.com.old` |
+
+  Con un solo item `ssh` e `sftp` restano sinonimi. Gli alias (`remote_alias`,
+  `remote_ssh_alias`) invece devono essere unici: un alias duplicato viene saltato.
 - I nomi già definiti a mano fuori dal blocco (sezioni rclone o `Host` in `~/.ssh/config`)
   hanno la precedenza: la voce da Bitwarden viene saltata con un avviso.
 - Prima di ogni scrittura salva un backup `<file>.bak-AAAAMMGGhhmmss`.

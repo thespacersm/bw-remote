@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
 VERSION = "0.1.0"
@@ -32,6 +32,10 @@ END = "# END bw-remote"
 HEADER = "# generato da bw-remote: non modificare a mano, viene sovrascritto"
 BLOCK_RE = re.compile(r"^# BEGIN bw-remote[ \t]*\n.*?^# END bw-remote[ \t]*(?:\n|\Z)", re.S | re.M)
 NAME_RE = re.compile(r"^[A-Za-z0-9_.+@-]+$")
+OLD_RE = re.compile(r"\bOLD\b")
+
+# a parita di remote_name, il tipo che in ogni file prende il nome senza suffisso
+PREFERRED = {"rclone": ["sftp", "ftps", "ftp", "ssh"], "ssh": ["ssh", "sftp"]}
 
 
 class ItemError(Exception):
@@ -55,6 +59,8 @@ class Remote:
     ssh_aliases: list = field(default_factory=list)
     rclone_opts: dict = field(default_factory=dict)
     ssh_opts: dict = field(default_factory=dict)
+    rtype: str = ""
+    old: bool = False
 
     @property
     def ssh_names(self):
@@ -209,28 +215,76 @@ def parse_remote(item):
         ssh_aliases=ssh_aliases,
         rclone_opts=rclone_opts,
         ssh_opts=ssh_opts,
+        rtype=rtype,
+        old=bool(OLD_RE.search(item.get("name", ""))),
     )
 
 
 def collect(items):
-    remotes, seen = [], {}
+    remotes = []
     for item in items:
         try:
             r = parse_remote(item)
         except ItemError as e:
             warn(f"{e}: saltato")
             continue
-        if r is None:
-            continue
-        names = [r.name] + [a for a, _ in r.aliases] + r.ssh_aliases
-        clash = [n for n in names if n in seen]
-        if clash:
-            warn(f"\"{r.item_name}\": {', '.join(clash)} gia usato da \"{seen[clash[0]]}\": saltato")
-            continue
-        for n in names:
-            seen[n] = r.item_name
-        remotes.append(r)
-    return sorted(remotes, key=lambda r: r.name)
+        if r is not None:
+            remotes.append(r)
+    remotes.sort(key=lambda r: (r.name, r.old, r.item_id))
+    drop_alias_clashes(remotes, "aliases", "remote_alias", key=lambda a: a[0])
+    drop_alias_clashes(remotes, "ssh_aliases", "remote_ssh_alias")
+    return remotes
+
+
+def drop_alias_clashes(remotes, attr, label, key=lambda a: a):
+    """Un alias non puo coincidere con un remote_name o con un altro alias: si salta l'alias."""
+    names = {r.name for r in remotes}
+    seen = {}
+    for r in remotes:
+        kept = []
+        for a in getattr(r, attr):
+            n = key(a)
+            other = "un remote_name" if n in names else seen.get(n)
+            if other:
+                warn(f"\"{r.item_name}\": {label} {n} gia usato da {other}: saltato")
+                continue
+            seen[n] = f"\"{r.item_name}\""
+            kept.append(a)
+        setattr(r, attr, kept)
+
+
+def resolve_names(remotes, target):
+    """Remote per un file (rclone o ssh) con i remote_name resi unici.
+
+    A parita di nome vince l'item non OLD, poi il tipo piu adatto al file, poi il piu
+    recente; gli altri prendono il suffisso .old (item con OLD nel nome) o .<remote_type>.
+    """
+    rank = PREFERRED[target]
+    groups = {}
+    for r in remotes:
+        if r.rtype in rank:
+            groups.setdefault(r.name, []).append(r)
+    taken = set(groups)
+    for r in remotes:
+        if target == "rclone":
+            taken.update(a for a, _ in r.aliases)
+        else:
+            taken.update(r.ssh_aliases)
+    out = []
+    for name, group in groups.items():
+        group.sort(key=lambda r: r.item_id)
+        group.sort(key=lambda r: r.revision, reverse=True)
+        group.sort(key=lambda r: (r.old, rank.index(r.rtype)))
+        out.append(group[0])
+        for r in group[1:]:
+            base = f"{name}.old" if r.old else f"{name}.{r.rtype}"
+            new, n = base, 2
+            while new in taken:
+                new, n = f"{base}-{n}", n + 1
+            taken.add(new)
+            warn(f"{target}: \"{r.item_name}\" diventa {new} ({name} e di \"{group[0].item_name}\")")
+            out.append(replace(r, name=new))
+    return sorted(out, key=lambda r: r.name)
 
 
 # --- rclone ------------------------------------------------------------------
@@ -305,7 +359,7 @@ def build_rclone(remotes, text):
                 warn(f"rclone: alias [{alias}] gia definito fuori dal blocco bw-remote: saltato")
             else:
                 aliases.append((alias, path))
-        kept.append(Remote(**{**r.__dict__, "aliases": aliases}))
+        kept.append(replace(r, aliases=aliases))
     block = render_rclone(kept, previous_passwords(match.group(0)) if match else {})
     if match:
         return text[:match.start()] + block + text[match.end():]
@@ -405,8 +459,8 @@ def cmd_sync(args):
     ssh_old = read(ssh_path)
     include_old = read(include_path)
     targets = [
-        (rclone_path, rclone_old, build_rclone(remotes, rclone_old)),
-        (include_path, include_old, render_ssh(remotes, ssh_hosts(ssh_old))),
+        (rclone_path, rclone_old, build_rclone(resolve_names(remotes, "rclone"), rclone_old)),
+        (include_path, include_old, render_ssh(resolve_names(remotes, "ssh"), ssh_hosts(ssh_old))),
         (ssh_path, ssh_old, ensure_include(ssh_old, include_path)),
     ]
 
@@ -466,7 +520,7 @@ def copy_id(r, pub, askpass):
 
 
 def cmd_copy_key(args):
-    remotes = [r for r in collect(load_items(args)) if r.kind == "sftp"]
+    remotes = resolve_names(collect(load_items(args)), "ssh")
     if args.names:
         remotes = [r for r in remotes
                    if any(fnmatch.fnmatch(n, p) for n in r.ssh_names for p in args.names)]

@@ -68,12 +68,52 @@ class ParseTest(unittest.TestCase):
             with self.assertRaises(bw.ItemError):
                 bw.parse_remote(note(fields=base + extra))
 
-    def test_duplicates_are_skipped(self):
-        f = [field("remote_type", "ssh"), field("remote_name", "same"), field("remote_host", "h")]
+    def test_old_flag_from_item_name(self):
+        f = [field("remote_type", "ssh"), field("remote_name", "n"), field("remote_host", "h")]
+        self.assertTrue(bw.parse_remote(login("OLD FTP sito", f)).old)
+        self.assertTrue(bw.parse_remote(login("Server sito OLD", f)).old)
+        self.assertFalse(bw.parse_remote(login("Server Golden", f)).old)
+
+    def test_alias_clashes_are_dropped(self):
+        a = [field("remote_type", "ssh"), field("remote_host", "h"), field("remote_alias", "x.prod:/a")]
         with mock.patch.object(bw, "warn") as w:
-            remotes = bw.collect([login("A", f), login("B", f)])
-        self.assertEqual([r.item_name for r in remotes], ["A"])
+            remotes = bw.collect([login("A", a + [field("remote_name", "a")]),
+                                  login("B", a + [field("remote_name", "b")])])
+        self.assertEqual([r.aliases for r in remotes], [[("x.prod", "/a")], []])
         w.assert_called_once()
+
+
+def item_for(name, rtype, item_name, rev="r1"):
+    return login(item_name, [field("remote_type", rtype), field("remote_name", name),
+                             field("remote_host", "h-" + item_name)], rev=rev)
+
+
+class ResolveNamesTest(unittest.TestCase):
+    def resolve(self, items, target):
+        with mock.patch.object(bw, "warn"):
+            return {r.name: r.item_name for r in bw.resolve_names(bw.collect(items), target)}
+
+    def test_old_item_gets_suffix(self):
+        items = [item_for("site.it", "ssh", "OLD FTP site"), item_for("site.it", "sftp", "SFTP site")]
+        expected = {"site.it": "SFTP site", "site.it.old": "OLD FTP site"}
+        self.assertEqual(self.resolve(items, "rclone"), expected)
+        self.assertEqual(self.resolve(items, "ssh"), expected)
+
+    def test_ssh_and_sftp_items_split_by_file(self):
+        items = [item_for("site.it", "ssh", "SSH root"), item_for("site.it", "sftp", "SFTP chroot")]
+        self.assertEqual(self.resolve(items, "rclone"), {"site.it": "SFTP chroot", "site.it.ssh": "SSH root"})
+        self.assertEqual(self.resolve(items, "ssh"), {"site.it": "SSH root", "site.it.sftp": "SFTP chroot"})
+
+    def test_single_item_keeps_name_and_ftp_stays_out_of_ssh(self):
+        items = [item_for("a.it", "ssh", "A"), item_for("b.it", "ftp", "B")]
+        self.assertEqual(self.resolve(items, "rclone"), {"a.it": "A", "b.it": "B"})
+        self.assertEqual(self.resolve(items, "ssh"), {"a.it": "A"})
+
+    def test_same_type_newest_wins_and_suffix_is_unique(self):
+        items = [item_for("s.it", "sftp", "vecchio", rev="r1"), item_for("s.it", "sftp", "nuovo", rev="r2"),
+                 item_for("s.it", "sftp", "altro OLD"), item_for("s.it", "sftp", "altro2 OLD")]
+        self.assertEqual(self.resolve(items, "rclone"),
+                         {"s.it": "nuovo", "s.it.sftp": "vecchio", "s.it.old": "altro OLD", "s.it.old-2": "altro2 OLD"})
 
 
 def sftp(name="web01", rev="r1", **kw):
