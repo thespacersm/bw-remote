@@ -36,6 +36,8 @@ LEGACY_LINE_RE = re.compile(r"^# (BEGIN bw-remote|END bw-remote|generato da bw-r
 SECTION_RE = re.compile(r"^\[([^\]]+)\]\s*$")
 # valori che rclone rileva al primo uso di un remote sftp e salva nel file
 AUTO_KEYS = ("shell_type", "md5sum_command", "sha1sum_command")
+DEFAULT_KEY = "~/.ssh/id_rsa"
+SFTP_SERVER = "/usr/lib/openssh/sftp-server"
 NAME_RE = re.compile(r"^[A-Za-z0-9_.+@-]+$")
 OLD_RE = re.compile(r"\bOLD\b")
 
@@ -72,6 +74,7 @@ class Remote:
     via: str = ""
     via_id: str = ""
     path: str = ""
+    sudo: str = ""
 
     @property
     def ssh_names(self):
@@ -190,8 +193,12 @@ def parse_remote(item):
     name = one("remote_name")
     via = one("remote_via")
     path = one("remote_path")
-    if path and not via:
-        raise ItemError(f"{label}: remote_path vale solo insieme a remote_via")
+    sudo = one("remote_via_sudo")
+    for key, value in (("remote_path", path), ("remote_via_sudo", sudo)):
+        if value and not via:
+            raise ItemError(f"{label}: {key} vale solo insieme a remote_via")
+    if sudo and not NAME_RE.match(sudo):
+        raise ItemError(f"{label}: remote_via_sudo '{sudo}' non valido")
     # con remote_via l'accesso diretto e facoltativo: senza host e utente c'e solo quello via macchina
     required = [("remote_name", name)]
     if not via or host or user:
@@ -239,6 +246,7 @@ def parse_remote(item):
         direct=bool(host),
         via=via,
         path=path,
+        sudo=sudo,
     )
 
 
@@ -278,7 +286,7 @@ def derive_via(remotes):
             continue
         out.append(replace(
             m, item_id=r.item_id, item_name=f"{r.item_name} (via {m.name})", revision=r.revision,
-            name=r.name, rtype="via", old=r.old, via=m.name, via_id=m.item_id, path=r.path,
+            name=r.name, rtype="via", old=r.old, via=m.name, via_id=m.item_id, path=r.path, sudo=r.sudo,
             aliases=[] if r.direct else r.aliases, ssh_aliases=[] if r.direct else r.ssh_aliases))
     return out
 
@@ -393,7 +401,23 @@ def obscure(pwd):
     return res.stdout.strip()
 
 
-def render_rclone(remotes, previous):
+def via_remote(machine, r):
+    """Destinazione dell'alias via macchina. Con remote_via_sudo rclone passa dal client ssh
+    (connessione da ssh config) e lancia sftp-server e gli hash come utente del sito."""
+    if not r.sudo:
+        return f"{machine}:{r.path}"
+    sudo = f"sudo -n -u {r.sudo}"
+    opts = {
+        "ssh": f"ssh -o BatchMode=yes -o LogLevel=ERROR {r.via}",
+        "server_command": f"{sudo} {SFTP_SERVER}",
+        "md5sum_command": f"{sudo} md5sum",
+        "sha1sum_command": f"{sudo} sha1sum",
+        "shell_type": "unix",
+    }
+    return machine + "".join(f",{k}='{v}'" for k, v in opts.items()) + f":{r.path}"
+
+
+def render_rclone(remotes, previous, default_key=""):
     """Una lista di righe per ogni sezione; previous: nome -> ((item_id, revision), valori)."""
     chunks = []
     # nome con cui la macchina compare in rclone.conf, per gli alias via macchina
@@ -405,7 +429,7 @@ def render_rclone(remotes, previous):
             if machine is None:
                 warn(f"rclone: {r.name}: la macchina {r.via} non e in rclone.conf: saltato")
                 continue
-            kv = {"type": "alias", "description": desc, "remote": f"{machine}:{r.path}"}
+            kv = {"type": "alias", "description": desc, "remote": via_remote(machine, r)}
         else:
             kv = {"type": r.kind, "description": desc, "host": r.host, "user": r.user, "port": str(r.port)}
             old_meta, old = previous.get(r.name, (None, {}))
@@ -413,8 +437,10 @@ def render_rclone(remotes, previous):
                 # rclone obscure cambia a ogni chiamata: se l'item non e cambiato teniamo la vecchia
                 same = old_meta == (r.item_id, r.revision) and old.get("pass")
                 kv["pass"] = old["pass"] if same else obscure(r.pwd)
-            if r.key:
-                kv["key_file"] = r.key
+            # la libreria sftp di rclone non prova le chiavi di default come fa ssh
+            key = r.key or (default_key if r.kind == "sftp" and not r.pwd else "")
+            if key:
+                kv["key_file"] = key
             if r.tls:
                 kv["explicit_tls"] = "true"
             kv.update(r.rclone_opts)
@@ -428,7 +454,7 @@ def render_rclone(remotes, previous):
     return chunks
 
 
-def build_rclone(remotes, text):
+def build_rclone(remotes, text, default_key=""):
     """Il file con le sezioni scritte a mano invariate e quelle di bw-remote rigenerate in fondo."""
     preamble, sections = split_sections(text)
     previous, manual = {}, []
@@ -457,7 +483,7 @@ def build_rclone(remotes, text):
         out += [l for l in lines if not LEGACY_LINE_RE.match(l)]
     while out and not out[-1].strip():
         out.pop()
-    chunks = render_rclone(kept, previous)
+    chunks = render_rclone(kept, previous, default_key)
     for chunk in chunks:
         out += ([""] if out else []) + chunk
     if not out:
@@ -555,7 +581,7 @@ def cmd_sync(args):
     ssh_old = read(ssh_path)
     include_old = read(include_path)
     targets = [
-        (rclone_path, rclone_old, build_rclone(resolve_names(remotes, "rclone"), rclone_old)),
+        (rclone_path, rclone_old, build_rclone(resolve_names(remotes, "rclone"), rclone_old, args.key)),
         (include_path, include_old, render_ssh(resolve_names(remotes, "ssh"), ssh_hosts(ssh_old))),
         (ssh_path, ssh_old, ensure_include(ssh_old, include_path)),
     ]
@@ -679,6 +705,8 @@ def main(argv=None):
     common.add_argument("--apply", action="store_true", help="scrive davvero (default: dry-run)")
     common.add_argument("--no-sync", action="store_true", help="non esegue bw sync")
     common.add_argument("--input", metavar="FILE", help="legge gli item da un JSON di bw list items invece che da bw")
+    common.add_argument("--key", default=DEFAULT_KEY,
+                        help=f"chiave privata per gli item senza remote_key (default {DEFAULT_KEY})")
 
     s = sub.add_parser("sync", parents=[common], help="aggiorna rclone.conf e ssh config")
     s.add_argument("--rclone-config", default=default_rclone_config())
@@ -688,7 +716,6 @@ def main(argv=None):
 
     c = sub.add_parser("copy-key", parents=[common], help="installa la chiave pubblica sugli host ssh/sftp usando la password")
     c.add_argument("names", nargs="*", help="remote_name o alias ssh (glob), default tutti")
-    c.add_argument("--key", default="~/.ssh/id_ed25519", help="chiave privata se l'item non ha remote_key")
     c.set_defaults(func=cmd_copy_key)
 
     args = p.parse_args(argv)

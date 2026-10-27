@@ -70,12 +70,13 @@ Il tool considera solo gli item con `remote_type`; tutti gli altri vengono ignor
 | `remote_user` | sì* | utente |
 | `remote_pwd` | no* | password (meglio come campo nascosto) |
 | `remote_port` | no | default 22 (ssh/sftp) o 21 (ftp/ftps) |
-| `remote_key` | no | chiave privata, es. `~/.ssh/id_ed25519` |
+| `remote_key` | no | chiave privata; se manca (e non c'è `remote_pwd`) rclone usa `--key`, default `~/.ssh/id_rsa` |
 | `remote_alias` | no, ripetibile | alias rclone `nome:path`, es. `example.com.prod:/var/www` |
 | `remote_ssh_alias` | no, ripetibile | nome in più sulla riga `Host` ssh |
 | `remote_opt` | no, ripetibile | opzione extra: `rclone:chiave=valore` o `ssh:Chiave=valore` |
 | `remote_via` | no | `remote_name` della macchina da cui si raggiunge il sito (vedi sotto) |
 | `remote_path` | no | cartella del sito sulla macchina, solo con `remote_via` |
+| `remote_via_sudo` | no | utente con cui accedere ai file del sito dalla macchina (`sudo -u`), solo con `remote_via` |
 
 \* Per i Login, se il campo manca si usano username, password e il primo URI
 `ssh://`, `sftp://`, `ftp://`, `ftps://` (o senza schema) dell'item. Se i custom field
@@ -127,7 +128,8 @@ Quando un sito ha un suo accesso SFTP (spesso chroot) e in più si raggiunge da 
 macchina su cui si ha un accesso ssh globale:
 
 1. l'item della macchina ha i suoi campi (`remote_type ssh`, `remote_name example-host`, …);
-2. l'item del sito ha, oltre ai suoi, `remote_via example-host` e `remote_path /srv/siti/example`.
+2. l'item del sito ha, oltre ai suoi, `remote_via example-host`, `remote_path /srv/siti/example`
+   e, se l'utente della macchina non può leggere i file del sito, `remote_via_sudo example`.
 
 Risultato:
 
@@ -141,6 +143,17 @@ In rclone resta principale l'accesso diretto, così i file caricati restano dell
 del sito; in ssh è principale la shell dalla macchina. Un item con `remote_via` ma
 senza host e utente genera solo l'accesso dalla macchina. `copy-key` salta gli accessi
 via macchina: la chiave va copiata sulla macchina una volta sola.
+
+Con `remote_via_sudo` l'alias rclone passa dal client `ssh` (connessione presa da
+`~/.ssh/config`, `Host` della macchina) e lancia `sftp-server` e gli hash con
+`sudo -n -u <utente>`: i file letti e scritti sono quelli dell'utente del sito.
+Serve sudo senza password per l'utente della macchina e `sftp-server` in
+`/usr/lib/openssh/sftp-server` (Debian/Ubuntu). Il client `ssh` apre una connessione
+per ogni hash: va bene per un sito, è lento su `rclone check` di migliaia di file.
+
+Perché rclone non usa sempre il client `ssh`: la sua libreria sftp è più veloce, funziona
+con la password e non dipende da `~/.ssh/config`; il client serve solo dove la libreria
+non arriva (qui il cambio utente con sudo).
 
 ## Uso
 
@@ -156,7 +169,7 @@ bw-remote copy-key 'example.*' --apply  # installa la chiave usando remote_pwd
 
 `copy-key` per ogni host:
 
-1. verifica se la chiave (`remote_key`, oppure `--key`, default `~/.ssh/id_ed25519`)
+1. verifica se la chiave (`remote_key`, oppure `--key`, default `~/.ssh/id_rsa`)
    permette già il login, prima con `sftp` e poi con `ssh`;
 2. se non lo permette, con `--apply` esegue `ssh-copy-id` con la password presa da
    Bitwarden e passata tramite `SSH_ASKPASS` (niente `sshpass`, la password non finisce
@@ -164,7 +177,8 @@ bw-remote copy-key 'example.*' --apply  # installa la chiave usando remote_pwd
 3. rifà il controllo e stampa l'esito.
 
 Opzioni comuni: `--no-sync` (salta `bw sync`), `--input FILE` (legge un JSON di
-`bw list items` invece di chiamare `bw`).
+`bw list items` invece di chiamare `bw`), `--key FILE` (chiave per gli item senza
+`remote_key`, default `~/.ssh/id_rsa`).
 
 ## Test
 

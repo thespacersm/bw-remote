@@ -145,6 +145,22 @@ class ViaTest(unittest.TestCase):
         self.assertRegex(out, r"\[site.it\]\ntype = sftp\ndescription = .*\nhost = 10.0.0.1\nuser = site\n")
         self.assertRegex(out, r"\[site.it.ssh\]\ntype = alias\ndescription = .*\nremote = mach:/srv/siti/site\n")
 
+    def test_via_sudo_uses_ssh_client_and_site_user(self):
+        self.site["fields"].append(field("remote_via_sudo", "site"))
+        rclone = self.resolve([self.machine, self.site], "rclone")
+        with mock.patch.object(bw, "obscure", side_effect=lambda pwd: "OBS"):
+            out = bw.build_rclone(list(rclone.values()), "")
+        self.assertIn("remote = mach,ssh='ssh -o BatchMode=yes -o LogLevel=ERROR mach',"
+                      "server_command='sudo -n -u site /usr/lib/openssh/sftp-server',"
+                      "md5sum_command='sudo -n -u site md5sum',sha1sum_command='sudo -n -u site sha1sum',"
+                      "shell_type='unix':/srv/siti/site\n", out)
+
+    def test_via_sudo_needs_via(self):
+        with self.assertRaises(bw.ItemError):
+            bw.parse_remote(note(fields=[field("remote_type", "ssh"), field("remote_name", "n"),
+                                         field("remote_host", "h"), field("remote_user", "u"),
+                                         field("remote_via_sudo", "x")]))
+
     def test_via_only_item(self):
         site = note("Solo via", [field("remote_type", "ssh"), field("remote_name", "site.it"),
                                  field("remote_via", "mach"), field("remote_path", "/srv/x")])
@@ -217,6 +233,14 @@ class RcloneTest(unittest.TestCase):
             out = bw.build_rclone([sftp(aliases=[("site.prod", "/www")])],
                                   "[web01]\ntype = local\n\n[site.prod]\ntype = local\n")
         self.assertEqual(out, "[web01]\ntype = local\n\n[site.prod]\ntype = local\n")
+
+    def test_default_key_only_without_password_and_key(self):
+        out = bw.build_rclone([sftp(name="a", pwd=""), sftp(name="b"), sftp(name="c", pwd="", key="~/.ssh/k"),
+                               sftp(name="d", kind="ftp", pwd="")], "", "~/.ssh/id_rsa")
+        sections = dict(bw.split_sections(out)[1])
+        self.assertIn("key_file = ~/.ssh/id_rsa", sections["a"])
+        self.assertFalse(any(l.startswith("key_file") for l in sections["b"] + sections["d"]))
+        self.assertIn("key_file = ~/.ssh/k", sections["c"])
 
     def test_ftps(self):
         out = bw.build_rclone([sftp(kind="ftp", tls=True, port=21, pwd="")], "")
