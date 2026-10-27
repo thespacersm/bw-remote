@@ -309,7 +309,7 @@ def drop_alias_clashes(remotes, attr, label, key=lambda a: a):
         setattr(r, attr, kept)
 
 
-def resolve_names(remotes, target):
+def resolve_names(remotes, target, report=None):
     """Remote per un file (rclone o ssh) con i remote_name resi unici.
 
     A parita di nome vince l'item non OLD, poi il tipo piu adatto al file, poi il piu
@@ -346,7 +346,7 @@ def resolve_names(remotes, target):
             while new in taken:
                 new, n = f"{base}-{n}", n + 1
             taken.add(new)
-            warn(f"{target}: \"{r.item_name}\" diventa {new} ({name} e di \"{group[0].item_name}\")")
+            (report or warn)(f"{target}: \"{r.item_name}\" diventa {new} ({name} e di \"{group[0].item_name}\")")
             out.append(replace(r, name=new))
     return sorted(out, key=lambda r: r.name)
 
@@ -598,6 +598,8 @@ def cmd_sync(args):
 
 # --- copy-key ----------------------------------------------------------------
 
+SFTP_ONLY = "utente solo SFTP (chroot): non puo installare chiavi, si continua con la password"
+
 ASKPASS = '#!/bin/sh\nprintf "%s\\n" "$BW_REMOTE_PASS"\n'
 
 
@@ -633,14 +635,19 @@ def copy_id(r, pub, askpass):
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
         if res.returncode == 0:
             return ""
-        lines = [l for l in (res.stderr + res.stdout).splitlines() if l.strip()]
+        out = res.stderr + res.stdout
+        if extra and "sftp> " in out:
+            # login riuscito ma ~/.ssh non scrivibile: la radice di un chroot e di root
+            return SFTP_ONLY
+        lines = [l for l in out.splitlines() if l.strip()]
         last = lines[-1] if lines else f"exit {res.returncode}"
     return last
 
 
 def cmd_copy_key(args):
     # gli accessi via macchina usano l'utente della macchina: la chiave va copiata una volta sola
-    remotes = [r for r in resolve_names(collect(load_items(args)), "ssh") if r.rtype != "via"]
+    report = warn if args.verbose else (lambda msg: None)
+    remotes = [r for r in resolve_names(collect(load_items(args)), "ssh", report) if r.rtype != "via"]
     if args.names:
         remotes = [r for r in remotes
                    if any(fnmatch.fnmatch(n, p) for n in r.ssh_names for p in args.names)]
@@ -675,7 +682,9 @@ def cmd_copy_key(args):
                     print(f"da fare {label}: aggiungerei {pub}")
                     continue
                 err = copy_id(r, pub, askpass)
-                if err:
+                if err == SFTP_ONLY:
+                    print(f"--   {label}: {err}")
+                elif err:
                     print(f"KO   {label}: {err}")
                     failed += 1
                 elif key_works(r, key):
@@ -755,6 +764,7 @@ def build_parser(conf):
 
     c = sub.add_parser("copy-key", parents=[common], help="installa la chiave pubblica sugli host ssh/sftp usando la password")
     c.add_argument("names", nargs="*", help="remote_name o alias ssh (glob), default tutti")
+    c.add_argument("-v", "--verbose", action="store_true", help="mostra anche i remote rinominati per nomi duplicati")
     c.set_defaults(func=cmd_copy_key)
     return p
 

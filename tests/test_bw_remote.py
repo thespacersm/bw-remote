@@ -268,6 +268,28 @@ class SshTest(unittest.TestCase):
         self.assertEqual(bw.ensure_include(out, path), out)
 
 
+class CopyKeyTest(unittest.TestCase):
+    def run_result(self, code, out=""):
+        return mock.Mock(returncode=code, stdout=out, stderr="")
+
+    def test_chroot_user_is_recognized(self):
+        results = [self.run_result(1, "This service allows sftp connections only.\n"),
+                   self.run_result(1, 'sftp> -mkdir .ssh\nsftp> chmod 700 ".ssh"\n')]
+        with mock.patch.object(bw.subprocess, "run", side_effect=results):
+            self.assertEqual(bw.copy_id(sftp(), "k.pub", "/askpass"), bw.SFTP_ONLY)
+
+    def test_other_errors_report_last_line(self):
+        results = [self.run_result(1, "Permission denied (password).\n")] * 2
+        with mock.patch.object(bw.subprocess, "run", side_effect=results):
+            self.assertEqual(bw.copy_id(sftp(), "k.pub", "/askpass"), "Permission denied (password).")
+
+    def test_rename_notices_can_be_silenced(self):
+        items = [item_for("s.it", "sftp", "nuovo"), item_for("s.it", "sftp", "vecchio OLD")]
+        with mock.patch.object(bw, "warn") as w:
+            bw.resolve_names(bw.collect(items), "ssh", lambda msg: None)
+        w.assert_not_called()
+
+
 class ConfigTest(unittest.TestCase):
     def write(self, text):
         fd, path = tempfile.mkstemp()

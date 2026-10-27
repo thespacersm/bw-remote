@@ -190,7 +190,13 @@ bw-remote copy-key 'example.*' --apply  # installa la chiave usando remote_pwd
 2. se non lo permette, con `--apply` esegue `ssh-copy-id` con la password presa da
    Bitwarden e passata tramite `SSH_ASKPASS` (niente `sshpass`, la password non finisce
    tra gli argomenti); se il server accetta solo sftp, riprova con `ssh-copy-id -s`;
-3. rifà il controllo e stampa l'esito.
+3. rifà il controllo e stampa l'esito: `ok` (funzionava già), `+` (aggiunta), `KO` (con il
+   motivo) oppure `--` per gli utenti solo SFTP in chroot, che non possono installare chiavi
+   e restano con la password (non conta come errore). Nel dry-run questi risultano ancora
+   `da fare`: si scopre solo provando.
+
+Gli avvisi sui remote rinominati per nomi duplicati compaiono solo in `sync`; in
+`copy-key` con `-v`.
 
 Opzioni comuni: `--no-sync` (salta `bw sync`), `--input FILE` (legge un JSON di
 `bw list items` invece di chiamare `bw`), `--config FILE`, `--key FILE` (chiave per gli item senza
