@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # remote_type -> tipo rclone
 TYPES = {"ssh": "sftp", "sftp": "sftp", "ftp": "ftp", "ftps": "ftp"}
